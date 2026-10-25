@@ -4,6 +4,12 @@ min_maki_version = "0.5.7"
 # maki 0.6.4+ gates maki.session.prompt behind `agent`.
 # Older versions ignore the key, so the floor stays at 0.5.7.
 agent = true
+# maki 0.6.6+ (unreleased) splits session access into three keys:
+# session_read = session.read, session_write = session.new/prompt,
+# session_settings = set_mode/set_title. 0.6.5 ignores unknown keys.
+session_read = true
+session_settings = true
+session_write = true
 fs_read = true
 fs_write = true
 net = false
