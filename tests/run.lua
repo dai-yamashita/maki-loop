@@ -72,12 +72,23 @@ local function host(files, json)
   local m = { api = {}, fs = {}, env = {}, uv = {}, session = {}, model = {}, task = {}, json = {}, async = {} }
   m.async.semaphore = function()
     local busy, waiters = false, {}
-    return { acquire = function()
-      if busy then waiters[#waiters + 1] = coroutine.running(); coroutine.yield("blocked") else busy = true end
+    local function permit()
       return { release = function()
         if #waiters > 0 then h.ready[#h.ready + 1] = table.remove(waiters, 1) else busy = false end
       end }
-    end }
+    end
+    return {
+      acquire = function()
+        h.acquired = (h.acquired or 0) + 1
+        if busy then waiters[#waiters + 1] = coroutine.running(); coroutine.yield("blocked") else busy = true end
+        return permit()
+      end,
+      try_acquire = function()
+        if h.no_permit or busy then return nil end
+        busy = true
+        return permit()
+      end,
+    }
   end
   m.api.register_command = function(spec) h.commands[spec.name] = spec end
   m.api.register_tool = function(spec) h.tools[spec.name] = spec end
@@ -143,21 +154,19 @@ local function host(files, json)
   m.task.list = function() local err = ui("tasks"); if err then return nil, err end; return copy(h.sessions[h.focus].tasks) end
   m.session.new = function(opts)
     assert(opts.prompt == nil)
-    eq(opts.focus, false)
+    -- 0.7.0 stores a session without prompt or focus, and refuses to store a
+    -- blank one, so this must always ask for a focused tab.
+    if not opts.focus then return nil, "cannot store a session with no messages" end
     local err = ui("new")
     if err then return nil, err end
     h.created = h.created + 1
     local s = copy(h.sessions[h.focus])
     s.id, s.status, s.queue, s.tasks = "n" .. h.created, "idle", { count = 0 }, { { id = "main" } }
+    if opts.mode then s.mode = opts.mode end
     if h.new_mutate then h.new_mutate(s) end
     h.sessions[s.id] = s
+    h.focus = s.id
     return s.id
-  end
-  m.session.set_mode = function(mode, opts)
-    local err = ui("mode")
-    if err then return nil, err end
-    h.sessions[opts.session].mode = mode
-    return true
   end
   m.session.prompt = function(text, opts)
     local err = ui("prompt")
@@ -201,11 +210,22 @@ test("package entrypoint registers loop commands, tool, and lifecycle hooks", fu
     assert(h.commands[name], "missing command: " .. name)
   end
   assert(h.tools.loop_complete)
-  for _, event in ipairs({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "SessionEnd", "SessionReset" }) do
+  for _, event in ipairs({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }) do
     assert(h.events[event], "missing event: " .. event)
   end
   eq(#h.prompts, 0)
   eq(h.created, 0)
+end)
+
+test("manifest declares maki 0.7.0 and the permissions the session API needs", function()
+  local file = assert(io.open("plugin.toml", "r"))
+  local text = file:read("*a")
+  file:close()
+  assert(text:find('min_maki_version = "0.7.0"', 1, true), "min_maki_version")
+  for _, key in ipairs({ "agent", "session_write", "session_read", "fs_read", "fs_write" }) do
+    assert(text:find(key .. " = true", 1, true), "missing permission: " .. key)
+  end
+  assert(text:find("session_settings = false", 1, true), "session_settings must not be requested")
 end)
 
 local function started()
@@ -252,6 +272,14 @@ for _, case in ipairs({ "blank", "headless", "wrong" }) do
     eq(#h.prompts, 0); eq(h.created, 0)
   end)
 end
+
+test("reject start in a stored session", function()
+  local h = host()
+  h.sessions.s1.status, h.sessions.s1.queue = "stored", nil
+  h.command("loop", "work")
+  eq(#h.prompts, 0); eq(h.created, 0)
+  assert(h.notes[#h.notes]:find("not open", 1, true))
+end)
 
 test("replacement commands and unrelated lifecycle", function()
   local h = started()
@@ -351,7 +379,7 @@ for _, point in ipairs({ "read", "focus", "current", "tasks", "model", "new", "m
   end)
 end
 
-for _, point in ipairs({ "current", "read", "focus", "model", "new", "mode", "mkdir", "write", "prompt" }) do
+for _, point in ipairs({ "current", "read", "focus", "model", "new", "mkdir", "write", "prompt" }) do
   test("new loop supersedes replacement startup at " .. point, function()
     local h = started()
     local fired = false
@@ -602,6 +630,23 @@ for _, event in ipairs({ "TurnError", "SessionReset", "SessionEnd" }) do
   end)
 end
 
+test("turn error without a message still interrupts", function()
+  local h = started()
+  h.emit("TurnError", { session_id = "s1" })
+  h.drain()
+  eq(h.saved().status, "interrupted")
+  assert(h.notes[#h.notes]:find("unknown", 1, true))
+end)
+
+test("stopped subagent does not block handoff", function()
+  local h = started()
+  h.emit("TaskStatusChanged", { session_id = "s1", id = "sub", status = "working" })
+  h.finish()
+  h.emit("TaskStopped", { session_id = "s1", id = "sub" })
+  h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+end)
+
 for _, reason in ipairs({ "shutdown", "reload", "replaced", "completed" }) do
   test("filesystem-only teardown " .. reason, function()
     local h = started(); h.finish()
@@ -610,6 +655,17 @@ for _, reason in ipairs({ "shutdown", "reload", "replaced", "completed" }) do
     h.drain(); h.tick(); eq(h.saved().status, "interrupted"); eq(h.created, 0)
   end)
 end
+
+test("teardown persists without acquiring the write semaphore", function()
+  local h = started(); h.finish()
+  h.detached = true
+  h.no_permit = true
+  h.acquired = 0
+  h.emit("SessionEnd", { session_id = "other", reason = "reload", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.acquired, 0)
+  eq(h.saved().status, "interrupted")
+end)
 
 for _, failure in ipairs({ "mkdir", "write", "encode", "new", "focus", "model", "tasks", "read", "prompt" }) do
   test("failure prevents retries " .. failure, function()

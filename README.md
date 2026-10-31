@@ -4,7 +4,7 @@ A simple maki plugin that adds a `/loop [Instructions]` command. This command wi
 
 ## Install
 
-Requires maki 0.5.7+ with `maki.pack` support, Git, and the interactive TUI in build mode.
+Requires maki 0.7.0+ with `maki.pack` support, Git, and the interactive TUI in build mode.
 
 1. Add this to your **global** `~/.config/maki/init.lua` (create it if needed):
 
@@ -16,10 +16,10 @@ Requires maki 0.5.7+ with `maki.pack` support, Git, and the interactive TUI in b
 
    If you use the legacy `~/.maki/` config directory, edit its `init.lua` instead. Package installation is global; don't put this in a project's `.maki/init.lua`.
 
-2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, plus `agent` on maki 0.6.4+ (needed to send the next prompt with `maki.session.prompt`; older versions ignore the key). It does not request network, process, or environment access.
+2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, `agent` and `session_write` to open the next session and send its prompt, and `session_read` so `TurnStart` arrives without its content being redacted. It does not request network, process, environment, chat input, or session-settings access.
 3. Use `/loop` in a build-mode session.
 
-> **This fork** (`dai-yamashita/maki-loop`) adds only `plugin.toml` lines on top of upstream: `agent` (needed on maki 0.6.4+) and, ahead of the release, `session_read` / `session_write` / `session_settings` (maki 0.6.6 splits session access into them; 0.6.5 and older ignore the keys). Pin it with `{ src = "https://github.com/dai-yamashita/maki-loop", version = "v0.5.7-agent.1" }` and switch back to the upstream URL once this change lands.
+> **This fork** (`dai-yamashita/maki-loop`) adds maki 0.7.0 support on top of upstream: the `agent`, `session_read`, and `session_write` permissions, and a focused `maki.session.new` call (0.7.0 cannot create a blank background session). Pin it with `{ src = "https://github.com/dai-yamashita/maki-loop", version = "v0.7.0-agent.1" }` and switch back to the upstream URL once this change lands.
 
 No copying files, extra `require`, or changes to your config's `plugin.toml` are needed. Maki loads `plugin/loop.lua` automatically, keeps the checkout in its managed data directory, and pins the installed commit in your global config's `pack-lock.json`.
 
@@ -33,7 +33,7 @@ To fetch and review an update:
 /packupdate maki-loop
 ```
 
-Accept the proposed revision, then run `/reload` to use it. Updates are explicit; normal startup uses the locked commit. You can share `pack-lock.json` to reproduce the same revisions on another machine, but permission approval is local to each machine.
+Accept the proposed revision, then run `/reload` to use it. Updates are explicit; normal startup uses the locked commit. A revision that changes the manifest also asks you to approve the new permission set. You can share `pack-lock.json` to reproduce the same revisions on another machine, but permission approval is local to each machine.
 
 To uninstall, remove the source from `maki.pack.add`, run `/reload`, then run:
 
@@ -49,7 +49,7 @@ Accept the removal prompt. Close any other maki processes still using the packag
 /loop Finish the tasks in TASKS.md. Record progress there and verify each change.
 ```
 
-`/loop` always starts a new objective, replacing any previous loop and revoking its pending continuation. The first iteration uses your current session when it is idle in build mode with no queued work or previous loop state. Otherwise it opens a fresh build-mode session immediately, leaving existing work and queued input untouched. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. No previous transcript or summary is passed along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt.
+`/loop` always starts a new objective, replacing any previous loop and revoking its pending continuation. The first iteration uses your current session when it is idle in build mode with no queued work or previous loop state. Otherwise it opens a fresh build-mode session immediately, leaving existing work and queued input untouched. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. No previous transcript or summary is passed along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt. On maki 0.7.0 a blank session cannot be stored in the background, so the fresh tab opens focused instead.
 
 The agent calls `loop_complete` when the whole objective is done.
 

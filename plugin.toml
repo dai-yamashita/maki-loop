@@ -1,17 +1,21 @@
-min_maki_version = "0.5.7"
+min_maki_version = "0.7.0"
 
 [permissions]
-# maki 0.6.4+ gates maki.session.prompt behind `agent`.
-# Older versions ignore the key, so the floor stays at 0.5.7.
+# maki.session.prompt needs `agent` and `session_write` in 0.7.0.
 agent = true
-# maki 0.6.6+ (unreleased) splits session access into three keys:
-# session_read = session.read, session_write = session.new/prompt,
-# session_settings = set_mode/set_title. 0.6.5 ignores unknown keys.
-session_read = true
-session_settings = true
+# maki.session.prompt and the focused maki.session.new({ focus = true }).
 session_write = true
+# TurnStart arrives with its content redacted without this, which makes maki
+# flash a one-time warning. Loop only reads metadata, but subscribes to
+# TurnStart to notice a manual follow-up turn.
+session_read = true
+# Loop state under the state dir.
 fs_read = true
 fs_write = true
+
+# Not used: set_mode/set_title, chat input writes, network, processes, env.
+session_settings = false
+input = false
 net = false
 run = false
 env = false

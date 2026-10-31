@@ -33,9 +33,13 @@ local function location(cwd)
   return table.concat(parts, "/")
 end
 
-local function persist(s)
-  local permit = writes:acquire()
-  if states[s.cwd] ~= s then permit:release(); return nil, "revoked" end
+local function persist(s, nowait)
+  local permit
+  if nowait then permit = writes:try_acquire() else permit = writes:acquire() end
+  if states[s.cwd] ~= s then
+    if permit then permit:release() end
+    return nil, "revoked"
+  end
   local dir, err = location(s.cwd)
   if dir then
     local ok
@@ -51,7 +55,7 @@ local function persist(s)
       err = err or "mkdir failed"
     end
   end
-  permit:release()
+  if permit then permit:release() end
   return not err, err
 end
 
@@ -68,7 +72,7 @@ end
 local function interrupt(s, reason, quiet)
   if not eligible(s) then return end
   revoke(s, "interrupted", reason)
-  local ok, err = persist(s)
+  local ok, err = persist(s, quiet)
   if not quiet then maki.notify("Loop interrupted: " .. reason .. (ok and "" or "; save failed: " .. tostring(err)), "warn") end
 end
 
@@ -91,6 +95,7 @@ local function call(s, guard, fn, ...)
 end
 
 local function environment(snapshot, cwd)
+  if snapshot.status == "stored" then return "Loop session is not open" end
   if type(snapshot.queue) ~= "table" then return "Interactive TUI required; headless/SDK/ACP are unsupported" end
   if maki.fs.normalize(snapshot.cwd) ~= cwd then return "Wrong project" end
 end
@@ -183,17 +188,17 @@ local function fresh(s, guard, parent, initial)
   if not snapshot then return end
   if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
   if reason then interrupt(s, reason); return end
-  local id = call(s, guard, maki.session.new, { focus = false })
+  -- 0.7.0 stores a session without `prompt` or `focus` instead of opening a
+  -- tab, and refuses to store one with no messages. So open the blank tab,
+  -- which also focuses it and inherits its mode from the parent.
+  local id = call(s, guard, maki.session.new, { focus = true, mode = "build" })
   if not id then return end
   s.owner, s.iteration, s.status = id, initial and 1 or s.iteration + 1, "running"
   s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent, s.starting = nil, false, false, {}, nil, nil
   s.sessions[s.iteration] = { id = id, iteration = s.iteration }
   guard = token(s)
-  if initial and not call(s, guard, maki.session.set_mode, "build", { session = id }) then return end
   local saved = call(s, guard, persist, s)
   if not saved then return end
-  ok = call(s, guard, maki.session.focus, id)
-  if not ok then return end
   local inherited = call(s, guard, maki.model.get)
   if not inherited then return end
   current = call(s, guard, maki.session.current)
@@ -343,7 +348,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "SessionEnd", "SessionReset" }, {
+maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }, {
   callback = function(ev)
     local s, d = active, ev.data
     local teardown = ev.event == "SessionEnd" and ({ shutdown = true, reload = true, replaced = true, completed = true })[d.reason]
@@ -372,10 +377,15 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
     if ev.event == "TurnStart" then
       if s.status == "running" and s.expect_start then s.expect_start = false
       else interrupt(s, "Manual follow-up turn") end
-    elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message))
+    elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message or d.reason or "unknown"))
     elseif ev.event == "SessionEnd" or ev.event == "SessionReset" then interrupt(s, "Session lifecycle: " .. tostring(d.reason or ev.event), true)
     elseif ev.event == "TaskStatusChanged" then
       s.tasks[d.id] = d.status
+      if s.status == "rollover_pending" then schedule(s) end
+    elseif ev.event == "TaskStopped" then
+      -- TaskStatusChanged compares once per frame, so a task that opened and
+      -- stopped in the same frame would stay "working" and block handoff.
+      s.tasks[d.id] = "cancelled"
       if s.status == "rollover_pending" then schedule(s) end
     elseif ev.event == "SessionStatusChanged" and s.status == "rollover_pending" then
       if d.status == "needs_input" or d.status == "working" then interrupt(s, "User work after terminal turn") else schedule(s) end
