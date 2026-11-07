@@ -154,7 +154,7 @@ local function host(files, json)
   m.task.list = function() local err = ui("tasks"); if err then return nil, err end; return copy(h.sessions[h.focus].tasks) end
   m.session.new = function(opts)
     assert(opts.prompt == nil)
-    -- 0.7.0 stores a session without prompt or focus, and refuses to store a
+    -- maki stores a session without prompt or focus, and refuses to store a
     -- blank one, so this must always ask for a focused tab.
     if not opts.focus then return nil, "cannot store a session with no messages" end
     local err = ui("new")
@@ -217,15 +217,34 @@ test("package entrypoint registers loop commands, tool, and lifecycle hooks", fu
   eq(h.created, 0)
 end)
 
-test("manifest declares maki 0.7.0 and the permissions the session API needs", function()
+test("manifest targets maki 0.7.1 and requests exactly the session permissions", function()
   local file = assert(io.open("plugin.toml", "r"))
   local text = file:read("*a")
   file:close()
-  assert(text:find('min_maki_version = "0.7.0"', 1, true), "min_maki_version")
-  for _, key in ipairs({ "agent", "session_write", "session_read", "fs_read", "fs_write" }) do
-    assert(text:find(key .. " = true", 1, true), "missing permission: " .. key)
+  eq(text:match('min_maki_version%s*=%s*"([^"]+)"'), "0.7.1")
+  local section, values = nil, {}
+  for line in text:gmatch("[^\n]+") do
+    line = line:gsub("#.*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local header = line:match("^%[([^%]]+)%]$")
+    if header then
+      section = header
+    elseif section == "permissions" and line ~= "" then
+      local key, value = line:match("^([%w_]+)%s*=%s*(%a+)$")
+      assert(key, "unparsed permission line: " .. line)
+      eq(values[key], nil)
+      values[key] = value == "true"
+    end
   end
-  assert(text:find("session_settings = false", 1, true), "session_settings must not be requested")
+  local seen = {}
+  for _, key in ipairs({ "agent", "session_write", "session_read", "fs_read", "fs_write" }) do
+    eq(values[key], true)
+    seen[key] = true
+  end
+  for _, key in ipairs({ "session_settings", "input", "net", "run", "env" }) do
+    eq(values[key], false)
+    seen[key] = true
+  end
+  for key in pairs(values) do assert(seen[key], "unknown permission: " .. key) end
 end)
 
 local function started()
@@ -279,6 +298,21 @@ test("reject start in a stored session", function()
   h.command("loop", "work")
   eq(#h.prompts, 0); eq(h.created, 0)
   assert(h.notes[#h.notes]:find("not open", 1, true))
+end)
+
+test("state directory failure interrupts before prompting", function()
+  local h = host()
+  local original = maki.env.state_dir
+  maki.env.state_dir = function() return nil, "unavailable" end
+  h.command("loop", "work")
+  maki.env.state_dir = original
+  eq(#h.prompts, 0); eq(h.created, 0)
+  assert(h.notes[#h.notes]:find("unavailable", 1, true))
+end)
+
+test("state is stored under the state dir with a hex-encoded cwd", function()
+  local h = started()
+  assert(h.files["/state/loops/2f70726f6a656374/state.json"], "state path")
 end)
 
 test("replacement commands and unrelated lifecycle", function()
@@ -676,6 +710,26 @@ test("turn error without a message still interrupts", function()
   eq(h.saved().status, "interrupted")
   assert(h.notes[#h.notes]:find("unknown", 1, true))
 end)
+
+test("SessionReset without a reason interrupts with the event name", function()
+  local h = started()
+  h.emit("SessionReset", { session_id = "s1" })
+  h.drain()
+  eq(h.saved().status, "interrupted")
+  assert(h.saved().reason:find("SessionReset", 1, true))
+end)
+
+for _, reason in ipairs({ "reset", "load", "delete" }) do
+  test("session end " .. reason .. " interrupts only the loop session", function()
+    local h = started()
+    h.emit("SessionEnd", { session_id = "other", reason = reason })
+    h.drain()
+    eq(h.saved().status, "running")
+    h.emit("SessionEnd", { session_id = "s1", reason = reason })
+    h.drain()
+    eq(h.saved().status, "interrupted")
+  end)
+end
 
 test("stopped subagent does not block handoff", function()
   local h = started()

@@ -190,7 +190,7 @@ local function fresh(s, guard, parent, initial)
   if not snapshot then return end
   if initial then reason = environment(snapshot, s.cwd) else reason = check(snapshot, s.cwd, true) end
   if reason then interrupt(s, reason); return end
-  -- 0.7.0 stores a session without `prompt` or `focus` instead of opening a
+  -- maki stores a session without `prompt` or `focus` instead of opening a
   -- tab, and refuses to store one with no messages. So open the blank tab,
   -- which also focuses it and inherits its mode from the parent.
   local id = call(s, guard, maki.session.new, { focus = true, mode = "build" })

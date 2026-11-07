@@ -1,9 +1,11 @@
-min_maki_version = "0.7.0"
+min_maki_version = "0.7.1"
 
 [permissions]
-# maki.session.prompt needs `agent` and `session_write` in 0.7.0.
+# maki.session.prompt needs `agent` and `session_write`.
 agent = true
 # maki.session.prompt and the focused maki.session.new({ focus = true }).
+# maki refuses to persist a session with no messages, so the tab must open
+# focused rather than as a stored background session.
 session_write = true
 # TurnStart arrives with its content redacted without this, which makes maki
 # flash a one-time warning. Loop only reads metadata, but subscribes to
