@@ -9,11 +9,42 @@ local function eq(a, b)
   assert(a == b, tostring(a) .. " ~= " .. tostring(b))
 end
 
+-- Strict UTF-8 validation: rejects overlong forms, surrogates, out-of-range
+-- leads, bad continuation bytes, and truncated trailing sequences.
+local function valid_utf8(s)
+  local i, n = 1, #s
+  while i <= n do
+    local c = s:byte(i)
+    if c < 0x80 then
+      i = i + 1
+    else
+      local need
+      if c >= 0xC2 and c <= 0xDF then need = 2
+      elseif c >= 0xE0 and c <= 0xEF then need = 3
+      elseif c >= 0xF0 and c <= 0xF4 then need = 4
+      else return false end
+      if i + need - 1 > n then return false end
+      for j = i + 1, i + need - 1 do
+        local b = s:byte(j)
+        if b < 0x80 or b > 0xBF then return false end
+      end
+      local b2 = s:byte(i + 1)
+      if c == 0xE0 and b2 < 0xA0 then return false end
+      if c == 0xED and b2 > 0x9F then return false end
+      if c == 0xF0 and b2 < 0x90 then return false end
+      if c == 0xF4 and b2 > 0x8F then return false end
+      i = i + need
+    end
+  end
+  return true
+end
+
 local null = newproxy()
 
 local function host(files, json)
   local h = { files = files or {}, json = json or {}, commands = {}, tools = {}, events = {}, timers = {},
-    ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {}, detached = false }
+    ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {},
+    detached = false, plans = {}, messages = {}, mkdirs = {} }
   h.sessions.s1 = { id = "s1", cwd = "/project", model = "provider/model", mode = "build", status = "idle",
     queue = { count = 0 }, updated_at = 1, settings = { spec = "provider/model", thinking = "high", fast = false },
     tasks = { { id = "main" } }, workflow = "default", yolo = true }
@@ -71,7 +102,7 @@ local function host(files, json)
     assert(not h.detached, "UI call in teardown: " .. name)
     return h.point(name)
   end
-  local m = { api = {}, fs = {}, env = {}, uv = {}, session = {}, model = {}, task = {}, json = {}, async = {} }
+  local m = { api = {}, fs = {}, env = {}, uv = {}, session = {}, plan = {}, model = {}, task = {}, json = {}, async = {} }
   m.async.semaphore = function()
     local busy, waiters = false, {}
     local function permit()
@@ -111,17 +142,23 @@ local function host(files, json)
     end
     return "/" .. table.concat(parts, "/")
   end
-  function h.saved(path)
-    if not path then
-      local cwd = m.fs.normalize(m.uv.cwd())
-      local key = cwd:gsub(".", function(c) return string.format("%02x", string.byte(c)) end)
-      local parts = { m.env.state_dir(), "loops" }
-      for i = 1, #key, 120 do parts[#parts + 1] = key:sub(i, i + 119) end
-      path = table.concat(parts, "/") .. "/state.json"
-    end
-    return copy(h.json[h.files[path]])
+  function h.state_path()
+    local cwd = m.fs.normalize(m.uv.cwd())
+    local key = cwd:gsub(".", function(c) return string.format("%02x", string.byte(c)) end)
+    local parts = { m.env.state_dir(), "loops" }
+    for i = 1, #key, 120 do parts[#parts + 1] = key:sub(i, i + 119) end
+    return table.concat(parts, "/") .. "/state.json"
   end
-  m.fs.mkdir = function(_, opts) eq(opts.parents, true); local err = h.point("mkdir"); if err then return nil, err end; return true end
+  function h.saved(path)
+    return copy(h.json[h.files[path or h.state_path()]])
+  end
+  m.fs.mkdir = function(path, opts)
+    eq(opts.parents, true)
+    h.mkdirs[#h.mkdirs + 1] = path
+    local err = h.point("mkdir")
+    if err then return nil, err end
+    return true
+  end
   m.fs.metadata = function(path) local err = h.point("metadata"); if err then return nil, err end; return h.files[path] and { is_file = true } end
   m.fs.read = function(path) local err = h.point("fs_read"); if err then return nil, err end; return h.files[path] end
   m.fs.atomic_write = function(path, text)
@@ -131,6 +168,14 @@ local function host(files, json)
     return true
   end
   m.json.encode = function(value)
+    -- One-shot failure, consumed before the sticky h.fail.encode, so a single
+    -- persist can be failed without disarming every later encode.
+    if h.fail_encode_once then
+      local err = h.fail_encode_once
+      h.fail_encode_once = nil
+      if type(err) == "function" then err() end
+      return nil, err
+    end
     if h.fail.encode then return nil, h.fail.encode end
     local id = "json:" .. tostring(#h.json + 1)
     h.json[#h.json + 1], h.json[id] = id, copy(value)
@@ -166,6 +211,24 @@ local function host(files, json)
     return true
   end
   m.model.get = function() local err = ui("model"); if err then return nil, err end; return copy(h.sessions[h.focus].settings) end
+  m.plan.read = function(opts)
+    local err = ui("plan")
+    if err then return nil, err end
+    -- The real host errors for unknown sessions instead of returning a blank.
+    if not h.sessions[opts.session] then return nil, "not live" end
+    return copy(h.plans[opts.session] or { mode = "build", ready = false })
+  end
+  m.session.messages = function(opts)
+    local err = ui("messages")
+    if err then return nil, err end
+    local list = copy(h.messages[opts.session] or {})
+    if opts.last and #list > opts.last then
+      local tail = {}
+      for i = #list - opts.last + 1, #list do tail[#tail + 1] = list[i] end
+      return tail
+    end
+    return list
+  end
   m.task.list = function() local err = ui("tasks"); if err then return nil, err end; return copy(h.sessions[h.focus].tasks) end
   m.session.new = function(opts)
     assert(opts.prompt == nil)
@@ -177,6 +240,8 @@ local function host(files, json)
     h.created = h.created + 1
     local s = copy(h.sessions[h.focus])
     s.id, s.status, s.queue, s.tasks = "n" .. h.created, "idle", { count = 0 }, { { id = "main" } }
+    -- A freshly opened session has no plan panel and no transcript of its own.
+    s.plan, s.messages = nil, nil
     if opts.mode then s.mode = opts.mode end
     if h.new_mutate then h.new_mutate(s) end
     h.sessions[s.id] = s
@@ -381,6 +446,347 @@ for _, status in ipairs({ "working", "needs_input", "queued", "plan" }) do
     eq(h.sessions.s1.queue.count, before.queue.count)
   end)
 end
+
+local function messages_with_tasks(count)
+  local call, result = { role = "assistant", content = {} }, { role = "user", content = {} }
+  for i = 1, count do
+    call.content[#call.content + 1] = { type = "tool_use", id = "t" .. i, name = "task", input = { description = "Scan " .. i } }
+    result.content[#result.content + 1] = { type = "tool_result", tool_use_id = "t" .. i, content = { { type = "text", text = "found answer " .. i } } }
+  end
+  return { call, result, { role = "assistant", content = { { type = "text", text = "iteration summary" } } } }
+end
+
+test("initial plan-mode launch carries the plan", function()
+  local h = host()
+  h.sessions.s1.mode = "plan"
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/p1.md", content = "# Plan\nDo the thing" }
+  h.command("loop", "objective")
+  eq(h.created, 1); eq(#h.prompts, 1)
+  local prompt = h.prompts[1].text
+  assert(prompt:find("/state/plans/p1.md", 1, true), "plan path")
+  assert(prompt:find("# Plan\nDo the thing", 1, true), "plan content")
+  assert(prompt:find("PLAN captured from plan mode", 1, true), "plan section")
+  assert(prompt:find("re-read the file before acting", 1, true), "plan safety wording")
+  assert(not prompt:find("No prior conversation or summary is supplied", 1, true), "removed disclaimer")
+  eq(h.calls.plan, 1)
+  eq(h.calls.messages, nil)
+end)
+
+test("initial launch does not carry a subagent digest", function()
+  local h = host()
+  h.sessions.s1.mode = "plan"
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/p1.md", content = "# Plan\nDo the thing" }
+  h.messages.s1 = messages_with_tasks(1)
+  h.command("loop", "objective")
+  eq(h.created, 1); eq(#h.prompts, 1)
+  assert(not h.prompts[1].text:find("PREVIOUS ITERATION RESULTS", 1, true))
+end)
+
+test("plan is sticky across iterations", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/sticky.md", content = "# Sticky plan" }
+  h.messages.s1 = messages_with_tasks(1)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.saved().plan.path, "/state/plans/sticky.md")
+  assert(h.prompts[2].text:find("/state/plans/sticky.md", 1, true))
+  assert(h.prompts[2].text:find("PREVIOUS ITERATION RESULTS", 1, true), "iteration 2 carry")
+  h.plans = {}
+  h.finish(); h.tick()
+  eq(h.created, 2); eq(#h.prompts, 3)
+  eq(h.saved().owner, "n2")
+  eq(h.saved().plan.path, "/state/plans/sticky.md")
+  assert(h.prompts[3].text:find("/state/plans/sticky.md", 1, true))
+  assert(h.prompts[3].text:find("# Sticky plan", 1, true))
+  assert(not h.prompts[3].text:find("PREVIOUS ITERATION RESULTS", 1, true), "carry leaked past one iteration")
+end)
+
+test("persisted plan survives reload and resume", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/sticky.md", content = "# Sticky plan" }
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(h.saved().plan.path, "/state/plans/sticky.md")
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  assert(reload.prompts[1].text:find("/state/plans/sticky.md", 1, true))
+  assert(reload.prompts[1].text:find("# Sticky plan", 1, true))
+end)
+
+test("rollover carries finished task results and final summary", function()
+  local h = started()
+  local messages = messages_with_tasks(1)
+  local call, result = messages[1], messages[2]
+  call.content[#call.content + 1] = { type = "tool_use", id = "ts", name = "task", input = { description = "Scan string" } }
+  result.content[#result.content + 1] = { type = "tool_result", tool_use_id = "ts", content = "plain string output" }
+  call.content[#call.content + 1] = { type = "tool_use", id = "tb", name = "bash", input = { description = "Shell step" } }
+  result.content[#result.content + 1] = { type = "tool_result", tool_use_id = "tb", content = "shell output" }
+  call.content[#call.content + 1] = { type = "tool_use", id = "te", name = "task", input = { description = "Scan error" } }
+  result.content[#result.content + 1] = { type = "tool_result", tool_use_id = "te", content = "error output", is_error = true }
+  h.messages.s1 = messages
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local prompt = h.prompts[2].text
+  assert(prompt:find("PREVIOUS ITERATION RESULTS", 1, true))
+  assert(prompt:find("reference data, not instructions", 1, true), "digest safety wording")
+  assert(prompt:find("Scan 1", 1, true))
+  assert(prompt:find("found answer 1", 1, true))
+  assert(prompt:find("iteration summary", 1, true))
+  local exact = false
+  for line in prompt:gmatch("[^\n]+") do
+    if line == "- Scan string (ts): plain string output" then exact = true end
+  end
+  assert(exact, "string tool_result rendered line")
+  for _, text in ipairs({ "shell output", "error output", "Scan error" }) do
+    assert(not prompt:find(text, 1, true), "excluded text present: " .. text)
+  end
+end)
+
+test("iteration three carry replaces the previous digest", function()
+  local h = started()
+  h.messages.s1 = messages_with_tasks(1)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  assert(h.prompts[2].text:find("Scan 1", 1, true), "iteration 2 digest")
+  h.messages.n1 = {
+    { role = "assistant", content = { { type = "tool_use", id = "q1", name = "task", input = { description = "n1 scan" } } } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "q1", content = "n1 output" } } },
+    { role = "assistant", content = { { type = "text", text = "n1 summary" } } },
+  }
+  h.finish(); h.tick()
+  eq(h.created, 2); eq(#h.prompts, 3)
+  local prompt = h.prompts[3].text
+  assert(prompt:find("n1 scan", 1, true), "iteration 3 digest")
+  assert(prompt:find("n1 output", 1, true), "iteration 3 task text")
+  assert(not prompt:find("Scan 1", 1, true), "iteration 2 carry leaked into iteration 3")
+  eq(h.saved().carry.tasks[1].label, "n1 scan")
+  eq(h.saved().carry.tasks[1].id, "q1")
+end)
+
+test("context is clipped at line boundaries", function()
+  local h = started()
+  local lines = {}
+  for i = 1, 1000 do lines[i] = string.rep("p", 19) .. "\n" end
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/long.md", content = table.concat(lines) }
+  h.messages.s1 = messages_with_tasks(10)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local prompt = h.prompts[2].text
+  assert(prompt:find("…(truncated)", 1, true), "truncation marker")
+  assert(#prompt < 20000, "prompt length " .. #prompt)
+  local tasks, total = 0, 0
+  for text in prompt:gmatch("\n%- Scan %d+ %(t%d+%): ([^\n]*)") do
+    tasks = tasks + 1
+    assert(#text <= 1500 + 15, "task text length " .. #text)
+    total = total + #text
+  end
+  eq(tasks, 6)
+  assert(total <= 8192, "task text total " .. total)
+  assert(#h.saved().plan.content <= 12288, "plan content length " .. #h.saved().plan.content)
+end)
+
+-- clip() cuts at byte 12273 (12288 minus the 15-byte marker). Both contents
+-- below put a codepoint boundary at a different offset, so byte 12273 is
+-- *inside* a codepoint; a cut that is safe only by accident (a pure run of
+-- 3-byte characters lands 12273 exactly on a boundary) would hide a broken
+-- utf8_trim. The ASCII "x" prefix shifts the run by one: 12273-1 = 12272 bytes
+-- of "あ" are kept, i.e. 12272 % 3 = 2 of 3 bytes, while 12273 % 4 = 1 of a
+-- "😀"'s 4 bytes is kept without its continuations.
+test("multibyte plan clipping cuts mid-codepoint and preserves UTF-8", function()
+  for _, case in ipairs({
+    { name = "3-byte", content = "x" .. string.rep("あ", 5000), continuation = true },
+    { name = "4-byte", content = string.rep("😀", 4000), continuation = false },
+  }) do
+    assert(valid_utf8(case.content))
+    local byte = case.content:byte(12273)
+    if case.continuation then
+      assert(byte >= 0x80 and byte < 0xC0, case.name .. ": cut splits a multibyte sequence")
+    else
+      assert(byte >= 0xF0, case.name .. ": cut leaves a 4-byte lead without continuations")
+    end
+    local h = started()
+    h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/utf8.md", content = case.content }
+    h.finish(); h.tick()
+    eq(h.created, 1); eq(#h.prompts, 2); eq(h.saved().status, "running")
+    local prompt = h.prompts[2].text
+    assert(valid_utf8(prompt), case.name .. ": prompt is valid UTF-8")
+    assert(valid_utf8(h.saved().plan.content), case.name .. ": saved plan is valid UTF-8")
+    assert(prompt:find("…(truncated)", 1, true), case.name .. ": prompt marker")
+    assert(h.saved().plan.content:find("…(truncated)", 1, true), case.name .. ": persisted marker")
+    assert(#h.saved().plan.content <= 12288, case.name .. ": plan content length " .. #h.saved().plan.content)
+  end
+end)
+
+test("oversized single task result is clipped to the per-item cap", function()
+  local h = started()
+  h.messages.s1 = {
+    { role = "assistant", content = { { type = "tool_use", id = "big", name = "task", input = { description = "Big scan" } } } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = "big", content = string.rep("a", 2000) } } },
+  }
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local task = h.saved().carry.tasks[1]
+  eq(task.label, "Big scan")
+  assert(#task.text <= 1500 + 15, "task text length " .. #task.text)
+  assert(task.text:find("…(truncated)", 1, true), "task truncation marker")
+  assert(h.prompts[2].text:find("…(truncated)", 1, true), "prompt truncation marker")
+end)
+
+test("ten task results keep the newest six within the carry budget", function()
+  local h = started()
+  local call, result = { role = "assistant", content = {} }, { role = "user", content = {} }
+  for i = 1, 10 do
+    call.content[#call.content + 1] = { type = "tool_use", id = "t" .. i, name = "task", input = { description = "Scan " .. i } }
+    result.content[#result.content + 1] = { type = "tool_result", tool_use_id = "t" .. i,
+      content = "result " .. i .. " " .. string.rep("z", 1000) }
+  end
+  h.messages.s1 = { call, result }
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local tasks, total = h.saved().carry.tasks, 0
+  eq(#tasks, 6)
+  eq(tasks[1].id, "t5"); eq(tasks[#tasks].id, "t10")
+  for _, task in ipairs(tasks) do total = total + #task.text end
+  assert(total <= 8192, "carry total " .. total)
+  local prompt = h.prompts[2].text
+  assert(prompt:find("Scan 10", 1, true))
+  assert(not prompt:find("Scan 4", 1, true), "older task leaked into the prompt")
+end)
+
+test("oversized iteration summary is clipped to the summary cap", function()
+  local h = started()
+  h.messages.s1 = { { role = "assistant", content = { { type = "text", text = string.rep("s", 3000) } } } }
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local summary = h.saved().carry.summary
+  assert(summary, "summary kept")
+  assert(#summary <= 2000 + 15, "summary length " .. #summary)
+  assert(summary:find("…(truncated)", 1, true), "summary truncation marker")
+  assert(h.prompts[2].text:find("…(truncated)", 1, true), "prompt truncation marker")
+end)
+
+test("capture failure never interrupts rollover", function()
+  local h = started()
+  h.fail.plan = "plan down"
+  h.fail.messages = "messages down"
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.saved().status, "running")
+  assert(h.saved().capture_note:find("capture:", 1, true))
+  h.command("loop-status")
+  assert(h.notes[#h.notes]:find("| capture: plan down", 1, true))
+end)
+
+test("encode failure drops captured context and keeps the loop running", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/enc.md", content = "# enc plan" }
+  h.messages.s1 = messages_with_tasks(1)
+  -- The rollover_pending persist happens first, so arm the one-shot after it.
+  h.finish()
+  h.fail_encode_once = "utf8"
+  h.tick()
+  eq(h.fail_encode_once, nil)
+  assert(h.files[h.state_path()], "state file was written after the retry")
+  local saved = h.saved()
+  eq(saved.status, "running")
+  eq(saved.plan, nil)
+  eq(saved.carry, nil)
+  eq(saved.capture_note, "context dropped: state encode failed")
+  eq(saved.starting, nil)
+  eq(h.created, 1); eq(#h.prompts, 2)
+end)
+
+test("message-path fallback finds a plan", function()
+  local h = started()
+  h.messages.s1 = { { role = "assistant", content = { { type = "text", text = "Plan: /state/plans/fallback.md" } } } }
+  h.files["/state/plans/fallback.md"] = "# fallback plan"
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local prompt = h.prompts[2].text
+  assert(prompt:find("/state/plans/fallback.md", 1, true))
+  assert(prompt:find("# fallback plan", 1, true))
+end)
+
+test("message-path fallback rejects plans outside the state plans directory", function()
+  local h = started()
+  h.messages.s1 = { { role = "assistant", content = { { type = "text", text = "Plan: /elsewhere/plans/stolen.md" } } } }
+  h.files["/elsewhere/plans/stolen.md"] = "# stolen"
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.saved().plan, nil)
+  assert(not h.prompts[2].text:find("PLAN captured", 1, true))
+  assert(not h.prompts[2].text:find("# stolen", 1, true))
+end)
+
+test("message-path fallback requires the plan file to exist", function()
+  local h = started()
+  h.messages.s1 = { { role = "assistant", content = { { type = "text", text = "Plan: /state/plans/missing.md" } } } }
+  eq(h.files["/state/plans/missing.md"], nil)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.saved().plan, nil)
+  assert(not h.prompts[2].text:find("PLAN captured", 1, true))
+end)
+
+test("prompt baseline is unchanged without context", function()
+  local h = started()
+  local prompt = h.prompts[1].text
+  eq(prompt:sub(-#"do the work"), "do the work")
+  assert(prompt:find("a fresh session will repeat the objective", 1, true), "continuation wording")
+  assert(prompt:find("Original objective (verbatim)", 1, true))
+  assert(not prompt:find("No prior conversation or summary is supplied", 1, true))
+  assert(not prompt:find("PLAN captured", 1, true))
+  assert(not prompt:find("PREVIOUS ITERATION RESULTS", 1, true))
+  eq(h.calls.plan, nil)
+end)
+
+test("state writes stay inside the loop directory", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/write.md", content = "# plan" }
+  h.messages.s1 = messages_with_tasks(1)
+  h.finish(); h.tick()
+  eq(h.saved().plan.path, "/state/plans/write.md")
+  local expected = h.state_path()
+  local written = 0
+  for path in pairs(h.files) do
+    eq(path, expected)
+    written = written + 1
+  end
+  eq(written, 1)
+  assert(#h.mkdirs > 0)
+  for _, path in ipairs(h.mkdirs) do eq(path:sub(1, #"/state/loops/"), "/state/loops/") end
+
+  local fallback = host()
+  fallback.files["/state/plans/keep.md"] = "# keep"
+  fallback.messages.s1 = { { role = "assistant", content = { { type = "text", text = "see /state/plans/keep.md" } } } }
+  local seeded = copy(fallback.files)
+  fallback.command("loop", "work")
+  fallback.finish(); fallback.tick()
+  eq(fallback.created, 1)
+  eq(fallback.saved().plan.path, "/state/plans/keep.md")
+  eq(fallback.files["/state/plans/keep.md"], "# keep")
+  local added = 0
+  for path in pairs(fallback.files) do
+    if seeded[path] == nil then
+      eq(path, fallback.state_path())
+      added = added + 1
+    end
+  end
+  eq(added, 1)
+  assert(#fallback.mkdirs > 0)
+  for _, path in ipairs(fallback.mkdirs) do eq(path:sub(1, #"/state/loops/"), "/state/loops/") end
+end)
+
+test("status shows the captured plan", function()
+  local h = host()
+  h.sessions.s1.mode = "plan"
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/status.md", content = "# status plan" }
+  h.command("loop", "objective")
+  h.command("loop-status")
+  assert(h.notes[#h.notes]:find("| plan /state/plans/status.md", 1, true))
+end)
 
 test("new loop replaces corrupt saved state without reading it", function()
   local h = started()
@@ -755,14 +1161,196 @@ test("stopped subagent does not block handoff", function()
   eq(h.created, 1); eq(#h.prompts, 2)
 end)
 
-for _, reason in ipairs({ "shutdown", "reload", "replaced", "completed" }) do
-  test("filesystem-only teardown " .. reason, function()
-    local h = started(); h.finish()
-    h.detached = true
-    h.emit("SessionEnd", { session_id = "other", reason = reason, deadline_ms = 100 })
-    h.drain(); h.tick(); eq(h.saved().status, "interrupted"); eq(h.created, 0)
+test("idle subagent blocks handoff", function()
+  local h = started()
+  h.sessions.s1.tasks[2] = { id = "t", status = "idle" }
+  h.finish(); h.tick()
+  eq(h.created, 0)
+  eq(h.saved().status, "interrupted")
+  assert(h.saved().reason:find("Active subagent", 1, true))
+
+  local changed = started()
+  changed.emit("TaskStatusChanged", { session_id = "s1", id = "t", status = "idle" })
+  changed.drain(); changed.finish(); changed.tick()
+  eq(changed.created, 0)
+  eq(changed.saved().status, "interrupted")
+  assert(changed.saved().reason:find("Active subagent", 1, true))
+
+  for _, status in ipairs({ "done", "cancelled" }) do
+    local finished = started()
+    finished.emit("TaskStatusChanged", { session_id = "s1", id = "t", status = status })
+    finished.drain(); finished.finish(); finished.tick()
+    eq(finished.created, 1); eq(#finished.prompts, 2)
+  end
+end)
+
+test("finished task in the task list does not block handoff", function()
+  local h = started()
+  h.sessions.s1.tasks[#h.sessions.s1.tasks + 1] = { id = "t", status = "done" }
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2); eq(h.saved().status, "running")
+end)
+
+test("capture is skipped when an active subagent blocks handoff", function()
+  local h = started(); h.finish()
+  h.calls.plan, h.calls.messages, h.calls.metadata, h.calls.fs_read = nil, nil, nil, nil
+  h.sessions.s1.tasks[2] = { id = "t", status = "working" }
+  h.tick()
+  eq(h.created, 0); eq(h.saved().status, "interrupted")
+  eq(h.calls.plan, nil); eq(h.calls.messages, nil)
+  assert(h.saved().reason:find("Active subagent", 1, true))
+end)
+
+test("failed deferred handoff can resume", function()
+  local h = started(); h.finish()
+  h.fail.focus = "focus down"
+  h.tick()
+  eq(h.saved().starting, nil)
+  eq(h.saved().status, "interrupted")
+  h.fail.focus = nil
+  h.command("loop-resume"); eq(h.created, 1)
+  assert(not h.complete("done").is_error)
+end)
+
+test("aborted initial launch clears persisted starting", function()
+  local h = host()
+  h.sessions.s1.status = "working"
+  h.fail.new = "new down"
+  h.command("loop", "objective")
+  eq(h.created, 0); eq(#h.prompts, 0)
+  local persisted = false
+  for key, value in pairs(h.json) do
+    if type(key) == "string" and type(value) == "table" and value.starting == true then persisted = true end
+  end
+  assert(persisted, "starting was not persisted before new")
+  eq(h.saved().starting, nil)
+  eq(h.saved().status, "interrupted")
+  assert(h.saved().reason:find("new down", 1, true))
+  h.fail.new = nil
+  h.sessions.s1.status = "idle"
+  h.command("loop-resume")
+  eq(h.created, 1); eq(#h.prompts, 1)
+  assert(not h.complete("done").is_error)
+end)
+
+-- Arm h.fail[point] on the nth call of that host point, so a failure meant for
+-- the handoff is not consumed by the initial session read in start().
+local function fail_on(h, point, nth)
+  h.hook = function(name)
+    if name == point and h.calls[point] == nth then h.fail[point] = "injected " .. point end
+  end
+end
+
+for _, case in ipairs({
+  { name = "focus", point = "focus", nth = 1 },
+  { name = "current", point = "current", nth = 2 },
+  { name = "read", point = "read", nth = 2 },
+  { name = "model", point = "model", nth = 1 },
+}) do
+  test("initial launch handoff failure " .. case.name .. " is resumable", function()
+    local h = host()
+    h.sessions.s1.mode = "plan"  -- forces initial=true through the handoff
+    fail_on(h, case.point, case.nth)
+    h.command("loop", "objective")
+    eq(h.created, 0); eq(#h.prompts, 0)
+    eq(h.saved().starting, nil)
+    eq(h.saved().status, "interrupted")
+    assert(h.saved().reason:find("injected " .. case.point, 1, true))
+    h.fail[case.point] = nil
+    h.sessions.s1.mode = "build"
+    h.command("loop-resume")
+    eq(h.created, 1); eq(#h.prompts, 1)
+    eq(h.saved().starting, nil)
+    assert(not h.complete("done").is_error)
   end)
 end
+
+-- Host-wide teardown is not owner-scoped: any session id marks the loop dead.
+for _, reason in ipairs({ "shutdown", "reload" }) do
+  for _, session in ipairs({ "other", "s1" }) do
+    test("filesystem-only teardown " .. reason .. " from " .. session, function()
+      local h = started(); h.finish()
+      h.detached = true
+      h.emit("SessionEnd", { session_id = session, reason = reason, deadline_ms = 100 })
+      h.drain(); h.tick(); eq(h.saved().status, "interrupted"); eq(h.created, 0)
+    end)
+  end
+end
+
+-- `replaced`/`completed` only matter when the loop's own session ends, and the
+-- pending rollover legitimately continues afterwards, so nothing notifies.
+for _, reason in ipairs({ "replaced", "completed" }) do
+  test("teardown " .. reason .. " from other keeps the loop running", function()
+    local h = started(); h.finish()
+    h.emit("SessionEnd", { session_id = "other", reason = reason, deadline_ms = 100 })
+    h.drain()
+    eq(h.saved().status, "rollover_pending")
+    h.tick()
+    eq(h.saved().status, "running"); eq(h.created, 1); eq(#h.prompts, 2)
+  end)
+
+  test("teardown " .. reason .. " from the owner interrupts", function()
+    local h = started(); h.finish()
+    h.detached = true
+    h.emit("SessionEnd", { session_id = "s1", reason = reason, deadline_ms = 100 })
+    h.drain(); h.tick()
+    eq(h.saved().status, "interrupted"); eq(h.created, 0)
+    assert(h.saved().reason:find(reason, 1, true))
+  end)
+end
+
+test("teardown replaced after rollover does not interrupt the new owner", function()
+  local h = started(); h.finish(); h.tick()
+  eq(h.saved().owner, "n1"); eq(h.saved().status, "running")
+  h.emit("SessionEnd", { session_id = "s1", reason = "replaced", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.saved().status, "running"); eq(h.created, 1); eq(#h.prompts, 2)
+  h.finish(); h.tick()
+  eq(h.created, 2); eq(h.saved().iteration, 3)
+end)
+
+test("teardown completed from the armed resume parent interrupts", function()
+  local h = started(); h.command("loop-stop")
+  h.sessions.s1.status = "working"
+  h.command("loop-resume")
+  eq(h.saved().resume_parent, "s1")
+  h.emit("SessionEnd", { session_id = "s1", reason = "completed", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.saved().status, "interrupted"); eq(h.created, 0); eq(#h.prompts, 1)
+  assert(h.saved().reason:find("completed", 1, true))
+end)
+
+test("teardown replaced from the rollover owner interrupts", function()
+  local h = started(); h.finish(); h.tick()
+  eq(h.saved().owner, "n1"); eq(h.saved().status, "running")
+  h.detached = true
+  h.emit("SessionEnd", { session_id = "n1", reason = "replaced", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.saved().status, "interrupted"); eq(h.created, 1); eq(#h.prompts, 2)
+  assert(h.saved().reason:find("replaced", 1, true))
+end)
+
+test("teardown replaced from the armed resume parent interrupts", function()
+  local h = started(); h.command("loop-stop")
+  h.sessions.s1.status = "working"
+  h.command("loop-resume")
+  eq(h.saved().resume_parent, "s1")
+  h.emit("SessionEnd", { session_id = "s1", reason = "replaced", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.saved().status, "interrupted"); eq(h.created, 0); eq(#h.prompts, 1)
+  assert(h.saved().reason:find("replaced", 1, true))
+end)
+
+test("teardown replaced from other does not latch closed", function()
+  local h = started(); h.finish()
+  h.emit("SessionEnd", { session_id = "other", reason = "replaced", deadline_ms = 100 })
+  h.drain(); h.tick()
+  eq(h.created, 1)
+  h.command("loop-stop")
+  eq(h.saved().status, "stopped")
+  h.sessions[h.focus].status = "idle"
+  h.command("loop-resume"); eq(h.created, 2); eq(#h.prompts, 3)
+end)
 
 test("teardown persists without acquiring the write semaphore", function()
   local h = started(); h.finish()
@@ -845,6 +1433,168 @@ test("JSON null optional state fields retain nil semantics on reload", function(
   reload.command("loop-resume")
   eq(reload.created, 1)
   eq(#reload.prompts, 1)
+  assert(not reload.complete("done").is_error)
+end)
+
+test("old state without context fields still resumes", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.origin, s.plan, s.carry, s.capture_note = nil, nil, nil, nil
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  assert(not reload.notes[#reload.notes]:find("Corrupt", 1, true))
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+end)
+
+test("JSON null context fields are dropped on reload", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/null.md", content = "# null plan" }
+  h.messages.s1 = messages_with_tasks(1)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(h.saved().plan.path, "/state/plans/null.md")
+  local s = h.json[h.files[h.state_path()]]
+  s.origin, s.plan, s.carry, s.capture_note = null, null, null, null
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  eq(reload.saved().plan, nil); eq(reload.saved().carry, nil); eq(reload.saved().capture_note, nil)
+  eq(reload.saved().origin, "s1")
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  assert(not reload.complete("done").is_error)
+end)
+
+test("oversized stored plan is clipped on reload and stays valid UTF-8", function()
+  local h = started()
+  local content = string.rep("あ", 30000)
+  assert(#content > 65536)
+  local s = h.json[h.files[h.state_path()]]
+  s.plan = { path = "/state/plans/big.md", content = content, captured_iteration = 1 }
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  local saved = reload.saved().plan.content
+  assert(#saved <= 65536, "plan length " .. #saved)
+  assert(valid_utf8(saved), "clipped plan is valid UTF-8")
+  assert(saved:find("…(truncated)", 1, true), "truncation marker")
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  assert(valid_utf8(reload.prompts[1].text))
+end)
+
+test("reload clips oversized plan path and carry task id before prompting", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  local long_id = string.rep("i", 5000)
+  s.plan = { path = string.rep("p", 5000), content = "# capped plan", captured_iteration = 1 }
+  s.carry = { from_iteration = 1, session = "s1", summary = "stored summary",
+    tasks = { { id = long_id, label = "capped label", text = "stored body" } } }
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  assert(#reload.saved().plan.path <= 1024, "stored plan path length " .. #reload.saved().plan.path)
+  assert(#reload.saved().carry.tasks[1].id <= 200, "stored task id length " .. #reload.saved().carry.tasks[1].id)
+  assert(not reload.saved().plan.path:find("\n", 1, true), "clipped path is single-line")
+  assert(not reload.saved().carry.tasks[1].id:find("\n", 1, true), "clipped id is single-line")
+  -- The digest rebuilds the carry from the parent transcript, so give it the
+  -- same oversized id and let the transcript path apply the cap too.
+  reload.messages.s1 = {
+    { role = "assistant", content = { { type = "tool_use", id = long_id, name = "task", input = { description = "capped label" } } } },
+    { role = "user", content = { { type = "tool_result", tool_use_id = long_id, content = "fresh body" } } },
+    { role = "assistant", content = { { type = "text", text = "fresh summary" } } },
+  }
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  local saved = reload.saved()
+  assert(#saved.plan.path <= 1024, "resumed plan path length " .. #saved.plan.path)
+  assert(#saved.carry.tasks[1].id <= 200, "resumed task id length " .. #saved.carry.tasks[1].id)
+  local prompt = reload.prompts[1].text
+  for run in prompt:gmatch("p+") do assert(#run <= 1024, "prompt path run " .. #run) end
+  for run in prompt:gmatch("i+") do assert(#run <= 200, "prompt id run " .. #run) end
+  assert(prompt:find(saved.plan.path, 1, true), "prompt carries the clipped plan path")
+end)
+
+test("malformed context fields are dropped, not fatal", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.origin, s.capture_note = nil, string.rep("n", 500)
+  s.plan = { path = "", content = 5 }
+  s.carry = { tasks = "bad" }
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  local note = reload.notes[#reload.notes]
+  assert(not note:find("Corrupt", 1, true))
+  local saved_note = reload.saved().capture_note
+  assert(saved_note and #saved_note <= 300, "capture note length " .. tostring(saved_note and #saved_note))
+  assert(saved_note:find("…(truncated)", 1, true), "capture note marker")
+  assert(note:find(saved_note, 1, true), "status shows the clipped capture note")
+  eq(reload.saved().plan, nil); eq(reload.saved().carry, nil)
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+end)
+
+test("wrong-typed optional context fields are dropped, not corrupt", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.origin, s.plan, s.carry, s.capture_note = {}, 5, "bad", {}
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  assert(not reload.notes[#reload.notes]:find("Corrupt", 1, true))
+  local saved = reload.saved()
+  eq(saved.origin, "s1")
+  eq(saved.plan, nil); eq(saved.carry, nil); eq(saved.capture_note, nil)
+  reload.command("loop-resume"); eq(reload.created, 1)
+end)
+
+test("a throwing state encoder drops captured context instead of wedging", function()
+  local h = started()
+  h.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/boom.md", content = "# boom" }
+  h.finish()
+  h.fail_encode_once = function() error("encode boom") end
+  h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  local saved = h.saved()
+  eq(saved.plan, nil); eq(saved.carry, nil)
+  eq(saved.capture_note, "context dropped: state encode failed")
+  eq(saved.status, "running")
+end)
+
+test("origin is backfilled from id and used as a plan source", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.origin, s.id = nil, "s1:123"
+  local reload = host(h.files, h.json)
+  reload.sessions.s2 = copy(reload.sessions.s1)
+  reload.sessions.s2.id, reload.sessions.s2.status = "s2", "idle"
+  reload.focus = "s2"
+  reload.plans.s1 = { mode = "plan", ready = true, path = "/state/plans/origin.md", content = "# from origin" }
+  reload.command("loop-status")
+  eq(reload.saved().origin, "s1")
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  assert(reload.prompts[1].text:find("/state/plans/origin.md", 1, true))
+  assert(reload.prompts[1].text:find("# from origin", 1, true))
+end)
+
+-- The real host errors for an unknown session; capture must note it and keep
+-- rolling over instead of aborting the handoff.
+test("capture tolerates a vanished origin session", function()
+  local h = started()
+  local _, text = next(h.files)
+  h.json[text].origin = "gone"
+  local reload = host(h.files, h.json)
+  eq(reload.sessions.gone, nil)
+  reload.command("loop-status")
+  reload.command("loop-resume")
+  eq(reload.created, 1); eq(#reload.prompts, 1)
+  eq(reload.saved().status, "running")
+  assert(reload.saved().capture_note:find("not live", 1, true), "unknown session note")
   assert(not reload.complete("done").is_error)
 end)
 

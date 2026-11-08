@@ -12,7 +12,7 @@ Requires maki 0.7.1+ with `maki.pack` support, Git, and the interactive TUI in b
    maki.pack.add({
      {
        src = "https://github.com/dai-yamashita/maki-loop",
-       version = "v0.7.1-agent.2",
+       version = "v0.7.1-agent.3",
      },
    })
    ```
@@ -22,11 +22,11 @@ Requires maki 0.7.1+ with `maki.pack` support, Git, and the interactive TUI in b
    Package installation is global and maki reads the config directory at `~/.config/maki/`; don't put this in a project's `.maki/init.lua`. Maki 0.7.1 no longer reads the legacy `~/.maki/` layout (it moves it into place on first start), so edit `~/.config/maki/init.lua`.
 
 2. Start maki and accept the package installation and permission prompts. The plugin requests `fs_read` and `fs_write` to save and restore per-project loop state, `agent` and `session_write` to open the next session and send its prompt, and `session_read` so `TurnStart` arrives without its content being redacted. It does not request network, process, environment, chat input, or session-settings access.
-3. Use `/loop` in a build-mode session.
+3. Use `/loop` in a build-mode session. Running it from plan mode also works: it opens a fresh build-mode session and carries the plan into the first prompt.
 
-> **Fork distribution.** `dai-yamashita/maki-loop` is the maintained distribution. Upstream closed [PR #1](https://github.com/MatthewScholefield/maki-loop/pull/1) unmerged, so upstream's own pin stays on maki 0.6-era APIs and breaks on 0.7.x. This fork carries 0.7.x support — the `agent`, `session_read`, and `session_write` permissions, a focused `maki.session.new` call, and the handoff-flag fix — and targets maki 0.7.1.
+> **Fork distribution.** `dai-yamashita/maki-loop` is the maintained distribution. Upstream closed [PR #1](https://github.com/MatthewScholefield/maki-loop/pull/1) unmerged, so upstream's own pin stays on maki 0.6-era APIs and breaks on 0.7.x. This fork carries 0.7.x support — the `agent`, `session_read`, and `session_write` permissions, a focused `maki.session.new` call, the handoff-flag fix, and cross-iteration plan/subagent context — and targets maki 0.7.1.
 >
-> **Updating from `v0.7.0-agent.1`/`.2` or `v0.7.1-agent.1`:** changing the pin alone does nothing, because `pack-lock.json` records a commit and that wins over `version`. Edit the `version`, then run `/packupdate maki-loop` and accept the review; that restarts maki on the new revision, so no `/reload` is needed. Permissions are unchanged, so nothing new is approved. If you installed from the upstream URL, the source change re-runs the install prompt and asks for all permissions again.
+> **Updating from `v0.7.0-agent.1`/`.2`, `v0.7.1-agent.1`, or `v0.7.1-agent.2`:** changing the pin alone does nothing, because `pack-lock.json` records a commit and that wins over `version`. Edit the `version`, then run `/packupdate maki-loop` and accept the review; that restarts maki on the new revision, so no `/reload` is needed. Updating from `v0.7.1-agent.2` to `.3` works the same way: `/packupdate maki-loop` is still required because the lock wins, and permissions are unchanged, so nothing new is approved. If you installed from the upstream URL, the source change re-runs the install prompt and asks for all permissions again.
 
 No copying files, extra `require`, or changes to your config's `plugin.toml` are needed. Maki loads `plugin/loop.lua` automatically, keeps the checkout in its managed data directory, and pins the installed commit in your global config's `pack-lock.json`.
 
@@ -56,7 +56,7 @@ Accept the removal prompt. Close any other maki processes still using the packag
 /loop Finish the tasks in TASKS.md. Record progress there and verify each change.
 ```
 
-`/loop` always starts a new objective, replacing any previous loop and revoking its pending continuation. The first iteration uses your current session when it is idle in build mode with no queued work or previous loop state. Otherwise it opens a fresh build-mode session immediately, leaving existing work and queued input untouched. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. No previous transcript or summary is passed along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt. A blank session cannot be stored in the background (maki refuses to persist a session with no messages), so the fresh tab opens focused instead.
+`/loop` always starts a new objective, replacing any previous loop and revoking its pending continuation. The first iteration uses your current session when it is idle in build mode with no queued work or previous loop state. Otherwise it opens a fresh build-mode session immediately, leaving existing work and queued input untouched. After each normally finished turn, the plugin opens a fresh session with the same model settings and repeats the original objective. Whenever the loop opens a fresh session (the first launch when the current session cannot be reused, and every rollover), its prompt also carries reference data: the captured plan file path plus a clipped copy of the plan content (sticky across iterations, with a message-path fallback scan), and a bounded digest of the previous iteration's finished `task` subagent results plus its final assistant summary. A same-session first iteration needs none of that because its plan and transcript are still there. Nothing else from the prior transcript comes along, so it's meant for you to keep your ongoing task state / progress within some markdown file you reference in your prompt. A blank session cannot be stored in the background (maki refuses to persist a session with no messages), so the fresh tab opens focused instead. The plan panel in that fresh tab is still empty: maki attaches plans per session (`plan_path`) and has no API to attach an existing plan to a new session, so the agent receives the path and content while the plan `.md` stays on disk.
 
 The agent calls `loop_complete` when the whole objective is done.
 
@@ -64,7 +64,7 @@ The agent calls `loop_complete` when the whole objective is done.
 - `/loop-stop` — stop continuation without cancelling current work.
 - `/loop-resume` — resume a stopped or interrupted loop in a fresh session. During an active turn, arm continuation for when that turn finishes normally without cancelling it.
 
-Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume.
+Errors, cancellation, or conflicting user work interrupt continuation. Restarting or reloading requires an explicit resume. A fresh iteration is not started — the loop is interrupted — while any `task` subagent is still `working` or `idle`, and a session being replaced or completing only stops the loop when it is the loop's own session.
 
 Warning: **There is currently no iteration or spending limit**; use carefully.
 
