@@ -12,7 +12,7 @@ Requires maki 0.7.1+ with `maki.pack` support, Git, and the interactive TUI in b
    maki.pack.add({
      {
        src = "https://github.com/dai-yamashita/maki-loop",
-       version = "v0.7.1-agent.1",
+       version = "v0.7.1-agent.2",
      },
    })
    ```
@@ -26,7 +26,7 @@ Requires maki 0.7.1+ with `maki.pack` support, Git, and the interactive TUI in b
 
 > **Fork distribution.** `dai-yamashita/maki-loop` is the maintained distribution. Upstream closed [PR #1](https://github.com/MatthewScholefield/maki-loop/pull/1) unmerged, so upstream's own pin stays on maki 0.6-era APIs and breaks on 0.7.x. This fork carries 0.7.x support — the `agent`, `session_read`, and `session_write` permissions, a focused `maki.session.new` call, and the handoff-flag fix — and targets maki 0.7.1.
 >
-> **Updating from `v0.7.0-agent.1`/`.2`:** changing the pin alone does nothing, because `pack-lock.json` records a commit and that wins over `version`. Edit the `version`, then run `/packupdate maki-loop` and accept the review; that restarts maki on the new revision, so no `/reload` is needed. Permissions are unchanged, so nothing new is approved. If you installed from the upstream URL, the source change re-runs the install prompt and asks for all permissions again.
+> **Updating from `v0.7.0-agent.1`/`.2` or `v0.7.1-agent.1`:** changing the pin alone does nothing, because `pack-lock.json` records a commit and that wins over `version`. Edit the `version`, then run `/packupdate maki-loop` and accept the review; that restarts maki on the new revision, so no `/reload` is needed. Permissions are unchanged, so nothing new is approved. If you installed from the upstream URL, the source change re-runs the install prompt and asks for all permissions again.
 
 No copying files, extra `require`, or changes to your config's `plugin.toml` are needed. Maki loads `plugin/loop.lua` automatically, keeps the checkout in its managed data directory, and pins the installed commit in your global config's `pack-lock.json`.
 
