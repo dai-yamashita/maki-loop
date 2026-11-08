@@ -864,6 +864,16 @@ for _, field in ipairs({ "root", "objective", "sessions", "record", "summary" })
   end)
 end
 
+test("JSON null in a trailing iteration slot is rejected, not dropped", function()
+  local h = started()
+  local _, text = next(h.files)
+  h.json[text].sessions[2] = null
+  local reload = host(h.files, h.json)
+  reload.command("loop-resume"); reload.tick()
+  eq(#reload.prompts, 0); eq(reload.created, 0)
+  assert(reload.notes[#reload.notes]:find("Invalid iteration records", 1, true))
+end)
+
 for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd", "resume_parent",
   "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty" }) do
   test("reject corrupt state " .. corrupt, function()
