@@ -9,6 +9,8 @@ local function eq(a, b)
   assert(a == b, tostring(a) .. " ~= " .. tostring(b))
 end
 
+local null = newproxy()
+
 local function host(files, json)
   local h = { files = files or {}, json = json or {}, commands = {}, tools = {}, events = {}, timers = {},
     ready = {}, notes = {}, sessions = {}, focus = "s1", created = 0, prompts = {}, calls = {}, fail = {}, detached = false }
@@ -134,7 +136,20 @@ local function host(files, json)
     h.json[#h.json + 1], h.json[id] = id, copy(value)
     return id
   end
-  m.json.decode = function(text) if not h.json[text] then return nil, "malformed JSON" end; return copy(h.json[text]) end
+  m.json.decode = function(text, opts)
+    if h.json[text] == nil then return nil, "malformed JSON" end
+    local luanil = opts and opts.luanil or {}
+    local function decode(value)
+      if type(value) ~= "table" then return value end
+      local out = {}
+      for k, v in pairs(value) do
+        local drop = type(k) == "number" and luanil.array or type(k) == "string" and luanil.object
+        if v ~= null or not drop then out[k] = decode(v) end
+      end
+      return out
+    end
+    return decode(h.json[text])
+  end
   m.session.current = function() local err = ui("current"); if err then return nil, err end; return h.focus end
   m.session.read = function(opts)
     local err = ui("read")
@@ -816,6 +831,38 @@ test("reload requires resume, project isolation and normalized keys", function()
   local n = 0; for path in pairs(next.files) do n = n + 1; assert(not path:find("/project", 1, true)) end
   eq(n, 2)
 end)
+
+test("JSON null optional state fields retain nil semantics on reload", function()
+  local h = started()
+  local _, text = next(h.files)
+  local s = h.json[text]
+  s.reason, s.resume_parent, s.summary = null, null, null
+  local reload = host(h.files, h.json)
+  reload.command("loop-status")
+  eq(reload.saved().status, "interrupted")
+  eq(reload.saved().resume_parent, nil)
+  eq(reload.saved().summary, nil)
+  reload.command("loop-resume")
+  eq(reload.created, 1)
+  eq(#reload.prompts, 1)
+  assert(not reload.complete("done").is_error)
+end)
+
+for _, field in ipairs({ "root", "objective", "sessions", "record", "summary" }) do
+  test("reject JSON null in required state " .. field, function()
+    local h = started()
+    local _, text = next(h.files)
+    local s = h.json[text]
+    if field == "root" then h.json[text] = null
+    elseif field == "record" then s.sessions[1] = null
+    elseif field == "summary" then s.status, s.summary = "completed", null
+    else s[field] = null end
+    local reload = host(h.files, h.json)
+    reload.command("loop-resume"); reload.tick()
+    eq(#reload.prompts, 0); eq(reload.created, 0)
+    assert(reload.notes[#reload.notes]:find("Corrupt", 1, true) or reload.notes[#reload.notes]:find("Invalid", 1, true))
+  end)
+end
 
 for _, corrupt in ipairs({ "json", "version", "owner", "cost", "objective", "records", "summary", "cwd", "resume_parent",
   "sparse", "object", "mixed", "zero", "negative", "fractional", "extra", "empty" }) do
