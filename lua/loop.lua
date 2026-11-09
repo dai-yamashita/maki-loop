@@ -174,6 +174,7 @@ local function revoke(s, status, reason)
   s.status, s.reason = status, reason
   if timer then timer:stop(); timer = nil end
   s.starting = nil
+  s.used_tool = nil
 end
 
 local function interrupt(s, reason, quiet)
@@ -438,6 +439,7 @@ local function project()
   if count ~= s.iteration or s.sessions[s.iteration].id ~= s.owner then return nil, cwd, "Invalid owner record" end
   if closed or command_generation ~= generation then return nil, cwd, "revoked" end
   s.handoff, s.wake = nil, nil
+  s.used_tool = nil
   states[cwd] = s
   if eligible(s) then
     revoke(s, "interrupted", "Restart/reload requires explicit /loop-resume")
@@ -453,6 +455,10 @@ local function submit(s, guard)
   if not snapshot then return end
   local reason = check(snapshot, s.cwd, true)
   if reason then interrupt(s, reason); return end
+  -- A real model turn calls at least one tool. A provider error can arrive as
+  -- assistant text and end as a normal "finished" turn, so without this an
+  -- outage would be rolled over forever. Arm the guard for this turn only.
+  s.used_tool = false
   s.expect_start = true
   local prompt = build_prompt(s)
   local result = call(s, guard, maki.session.prompt, prompt, { session = s.owner })
@@ -497,6 +503,7 @@ local function fresh(s, guard, parent, initial)
   if not id then return end
   s.owner, s.iteration, s.status = id, initial and 1 or s.iteration + 1, "running"
   s.reason, s.ended, s.expect_start, s.tasks, s.resume_parent, s.starting = nil, false, false, {}, nil, nil
+  s.used_tool = nil
   s.sessions[s.iteration] = { id = id, iteration = s.iteration }
   guard = token(s)
   local saved = call(s, guard, persist, s)
@@ -592,6 +599,7 @@ local function start(opts, resume, command_token)
   end
   s.generation, s.status, s.reason = s.generation + 1, "running", nil
   s.ended, s.expect_start, s.tasks, s.starting = false, false, {}, initial or nil
+  s.used_tool = nil
   s.resume_parent = resume and snapshot.status ~= "idle" and parent or nil
   states[cwd], active = s, s
   local guard = token(s)
@@ -664,7 +672,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }, {
+maki.api.create_autocmd({ "ToolStart", "ToolDone", "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }, {
   callback = function(ev)
     local s, d = active, ev.data
     local host_wide = ev.event == "SessionEnd" and (d.reason == "shutdown" or d.reason == "reload")
@@ -687,6 +695,12 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
       end
       if eligible(s) then
         if d.reason ~= "finished" then interrupt(s, "Turn ended: " .. tostring(d.reason)); return end
+        if s.used_tool == false then
+          interrupt(s, "Iteration ended without a tool call; loop stopped")
+          return
+        end
+        -- This decision is made; never persist the per-turn flag.
+        s.used_tool = nil
         s.status = "rollover_pending"
         local guard = token(s)
         if not call(s, guard, persist, s) then return end
@@ -695,7 +709,12 @@ maki.api.create_autocmd({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusCha
       return
     end
     if not eligible(s) then return end
-    if ev.event == "TurnStart" then
+    if ev.event == "ToolStart" or ev.event == "ToolDone" then
+      -- A tool call proves the model responded. ToolDone also covers a call
+      -- whose start was rejected before dispatch (parse failure, boundary
+      -- block, or a denied input hook). Only the loop's own session counts.
+      if s.used_tool == false and d.session_id == s.owner then s.used_tool = true end
+    elseif ev.event == "TurnStart" then
       if s.status == "running" and s.expect_start then s.expect_start = false
       else interrupt(s, "Manual follow-up turn") end
     elseif ev.event == "TurnError" then interrupt(s, "Turn error: " .. tostring(d.message or d.reason or "unknown"))

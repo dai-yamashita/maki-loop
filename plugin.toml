@@ -9,7 +9,8 @@ agent = true
 session_write = true
 # TurnStart arrives with its content redacted without this, which makes maki
 # flash a one-time warning. Loop only reads metadata, but subscribes to
-# TurnStart to notice a manual follow-up turn.
+# TurnStart to notice a manual follow-up turn, and to ToolStart/ToolDone to
+# tell a real model turn from an in-band provider error before rolling over.
 session_read = true
 # Loop state under the state dir.
 fs_read = true

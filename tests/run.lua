@@ -92,8 +92,14 @@ local function host(files, json)
     for _, t in ipairs(timers) do if not t.stopped then h.spawn(t.fn) end end
     h.drain()
   end
-  function h.finish(reason, status, session)
+  function h.finish(reason, status, session, opts)
     session = session or h.focus
+    -- A normal finished turn called a tool; { no_tool = true } models a
+    -- provider failure that produced only assistant text.
+    if not (opts and opts.no_tool) then
+      h.emit("ToolStart", { session_id = session, tool = "bash" })
+      h.drain()
+    end
     h.sessions[session].status = status or "idle"
     h.emit("TurnEnd", { session_id = session, reason = reason or "finished", cost = 0.25 })
     h.drain()
@@ -290,7 +296,7 @@ test("package entrypoint registers loop commands, tool, and lifecycle hooks", fu
     assert(h.commands[name], "missing command: " .. name)
   end
   assert(h.tools.loop_complete)
-  for _, event in ipairs({ "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }) do
+  for _, event in ipairs({ "ToolStart", "ToolDone", "TurnStart", "TurnEnd", "TurnError", "SessionStatusChanged", "TaskStatusChanged", "TaskStopped", "SessionEnd", "SessionReset" }) do
     assert(h.events[event], "missing event: " .. event)
   end
   eq(#h.prompts, 0)
@@ -542,6 +548,50 @@ test("rollover carries finished task results and final summary", function()
   for _, text in ipairs({ "shell output", "error output", "Scan error" }) do
     assert(not prompt:find(text, 1, true), "excluded text present: " .. text)
   end
+end)
+
+test("a finished turn without a tool call stops the loop", function()
+  local h = started()
+  h.messages.s1 = {
+    { role = "user", content = { { type = "text", text = "do the work" } } },
+    { role = "assistant", content = { { type = "text", text = "[Error: Connect error resource_exhausted: Error]" } } },
+  }
+  h.finish("finished", "idle", "s1", { no_tool = true }); h.tick()
+  eq(h.created, 0); eq(#h.prompts, 1)
+  eq(h.saved().status, "interrupted")
+  assert(h.saved().reason:find("without a tool call", 1, true), "reason: " .. tostring(h.saved().reason))
+end)
+
+test("a tool done event without a start still marks the iteration", function()
+  local h = started()
+  h.emit("ToolDone", { session_id = "s1", tool = "bash", is_error = true })
+  h.drain()
+  h.finish("finished", "idle", "s1", { no_tool = true }); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+end)
+
+test("a failing rollover iteration stops instead of opening another session", function()
+  local h = started()
+  h.messages.s1 = messages_with_tasks(1)
+  h.finish(); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  h.messages.n1 = {
+    { role = "user", content = { { type = "text", text = "objective" } } },
+    { role = "assistant", content = { { type = "text", text = "[Error: Connect error resource_exhausted: Error]" } } },
+  }
+  h.finish("finished", "idle", "n1", { no_tool = true }); h.tick()
+  eq(h.created, 1); eq(#h.prompts, 2)
+  eq(h.saved().status, "interrupted")
+  assert(h.saved().reason:find("without a tool call", 1, true), "reason: " .. tostring(h.saved().reason))
+end)
+
+test("a stopped empty iteration resumes explicitly", function()
+  local h = started()
+  h.finish("finished", "idle", "s1", { no_tool = true }); h.tick()
+  eq(h.saved().status, "interrupted"); eq(h.created, 0)
+  h.command("loop-resume")
+  eq(h.created, 1); eq(#h.prompts, 2)
+  assert(h.prompts[2].text:find("do the work", 1, true), "resumed prompt lost the objective")
 end)
 
 test("iteration three carry replaces the previous digest", function()
@@ -937,7 +987,7 @@ for _, status in ipairs({ "working", "needs_input" }) do
     h.sessions.s1.status = "working"
     h.emit("SessionStatusChanged", { session_id = "s1", status = "working" })
     h.drain(); h.tick(); eq(h.created, 0)
-    h.finish("finished", "working"); h.tick(); eq(h.created, 0)
+    h.finish("finished", "working", nil, { no_tool = true }); h.tick(); eq(h.created, 0)
     h.sessions.s1.status = "idle"
     h.emit("SessionStatusChanged", { session_id = "s1", status = "idle" })
     h.drain(); h.tick(); h.tick()
@@ -949,11 +999,11 @@ for _, status in ipairs({ "working", "needs_input" }) do
 end
 
 test("resume adopts a manual turn after interruption", function()
-  local h = started(); h.finish("cancelled")
+  local h = started(); h.finish("cancelled", nil, nil, { no_tool = true })
   h.sessions.s1.status = "working"
   h.emit("TurnStart", { session_id = "s1", text = "continue the work" }); h.drain()
   h.command("loop-resume"); h.tick(); eq(h.created, 0)
-  h.finish(); h.tick()
+  h.finish("finished", "idle", nil, { no_tool = true }); h.tick()
   eq(h.created, 1); eq(h.saved().cost, 0.5); eq(h.saved().cost_reports, 2)
 end)
 
@@ -1068,8 +1118,11 @@ for _, status in ipairs({ "idle", "working" }) do
 end
 
 test("handoff execution flags are never persisted", function()
-  local h = started(); h.finish(); h.tick()
+  local h = started(); h.finish()
+  eq(h.saved().used_tool, nil)
+  h.tick()
   eq(h.created, 1); eq(h.saved().handoff, nil); eq(h.saved().wake, nil)
+  eq(h.saved().used_tool, nil)
 end)
 
 test("unexpected handoff errors interrupt instead of wedging resume", function()
